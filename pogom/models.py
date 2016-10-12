@@ -7,6 +7,7 @@ import sys
 import gc
 import time
 import geopy
+import os
 from peewee import SqliteDatabase, InsertQuery, \
     IntegerField, CharField, DoubleField, BooleanField, \
     DateTimeField, fn, DeleteQuery, CompositeKey, FloatField, SQL, TextField
@@ -704,6 +705,89 @@ class GymDetails(BaseModel):
     url = CharField()
     last_scanned = DateTimeField(default=datetime.utcnow)
 
+class Account(BaseModel):
+    name = CharField(primary_key=True, max_length=16)
+    password = CharField(max_length=20)
+    auth_service = CharField(max_length=10, default="ptc")
+    last_used = DateTimeField(default=datetime.utcfromtimestamp(0))
+    latitude = DoubleField()
+    longitude = DoubleField()
+    lock_time = DateTimeField(default=datetime.utcfromtimestamp(0))
+    lock_times = IntegerField(default=0)
+    lock_reason = CharField(null=True, max_length=50)
+
+    class Meta:
+        indexes = ((('latitude', 'longitude'), False),)
+
+    @staticmethod
+    def get_next(thread_id):
+        # init dblock if not exists
+        dblock, created = DbLock.get_or_create(name="account")
+        # clear any hanging locks
+        if dblock.time < datetime.utcfromtimestamp(time.time()-30):
+            dblock.pid = 0
+            dblock.thread = 0
+
+        while True:
+            log.debug("getting lock for accounts table")
+            while dblock.pid != 0 and dblock.thread != 0: # try to acquire lock over db
+                dblock = DbLock.get(name="account")
+                time.sleep(1)
+            dblock.pid = os.getpid() # write own pid
+            dblock.thread = thread_id
+            dblock.time = datetime.utcnow()
+            dblock.save()
+            check = DbLock.get(name="account")
+            if dblock.pid == check.pid and dblock.thread == check.thread: # check if lock could be acquired
+                break
+            time.sleep(1)
+        try:
+            log.debug("got lock for accounts table")
+
+            query = (Account.select()
+                    .where(Account.last_used < datetime.utcfromtimestamp(time.time() - (15 * 60)),
+                        Account.lock_time < datetime.utcnow())
+                    .order_by(Account.last_used)
+                    .limit(1))
+            acc = query.first()
+
+            if acc is not None:
+                acc.last_used = datetime.utcnow()
+                if acc.lock_time is None:
+                    acc.lock_time = datetime.utcfromtimestamp(0)
+                acc.save()
+
+        # release dblock
+        finally:
+            dblock.pid = 0
+            dblock.thread = 0
+            dblock.save()
+        return acc
+
+    def use(acc, Lat, Lng):
+        acc.last_used = datetime.utcnow()
+        acc.latitude = Lat
+        acc.longitude = Lng
+        acc.save()
+
+    def lock(acc, lock_time, reason):
+        acc.lock_time = datetime.utcfromtimestamp(time.time() + (lock_time * (2 ** acc.lock_times)))
+        acc.lock_times += 1
+        acc.lock_reason = reason
+        acc.save()
+
+    def reset_lock(acc):
+        if acc.lock_times > 0:
+            acc.lock_time = datetime.utcfromtimestamp(0)
+            acc.lock_times = 0
+            acc.lock_reason = null
+            acc.save()
+
+class DbLock(BaseModel):
+    name = CharField(max_length=10, primary_key=True)
+    pid = IntegerField(default=0)
+    thread = IntegerField(default=0)
+    time = DateTimeField(default=datetime.utcfromtimestamp(0))
 
 def hex_bounds(center, steps):
     # Make a box that is (70m * step_limit * 2) + 70m away from the center point
@@ -1169,13 +1253,13 @@ def bulk_upsert(cls, data):
 def create_tables(db):
     db.connect()
     verify_database_schema(db)
-    db.create_tables([Pokemon, Pokestop, Gym, ScannedLocation, GymDetails, GymMember, GymPokemon, Trainer, MainWorker, WorkerStatus], safe=True)
+    db.create_tables([Account, DbLock, Pokemon, Pokestop, Gym, ScannedLocation, GymDetails, GymMember, GymPokemon, Trainer, MainWorker, WorkerStatus], safe=True)
     db.close()
 
 
 def drop_tables(db):
     db.connect()
-    db.drop_tables([Pokemon, Pokestop, Gym, ScannedLocation, Versions, GymDetails, GymMember, GymPokemon, Trainer, MainWorker, WorkerStatus, Versions], safe=True)
+    db.drop_tables([Account, DbLock, Pokemon, Pokestop, Gym, ScannedLocation, Versions, GymDetails, GymMember, GymPokemon, Trainer, MainWorker, WorkerStatus, Versions], safe=True)
     db.close()
 
 
