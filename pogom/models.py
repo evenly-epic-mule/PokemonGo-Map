@@ -347,13 +347,15 @@ class Pokemon(BaseModel):
         query = (query.where((Pokemon.latitude <= n) &
                              (Pokemon.latitude >= s) &
                              (Pokemon.longitude >= w) &
-                             (Pokemon.longitude <= e)
+                             (Pokemon.longitude <= e) &
+                             (Pokemon.disappear_time > (datetime.now() - timedelta(days=1)))
                              ))
         # Sqlite doesn't support distinct on columns
-        if args.db_type == 'mysql':
-            query = query.distinct(Pokemon.spawnpoint_id)
-        else:
-            query = query.group_by(Pokemon.spawnpoint_id)
+        #if args.db_type == 'mysql':
+        #    # why the f**k is mysql breaking this?
+        #    query = query.distinct(Pokemon.spawnpoint_id)
+        #else:
+        query = query.group_by(Pokemon.spawnpoint_id)
 
         s = list(query.dicts())
 
