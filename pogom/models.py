@@ -780,7 +780,7 @@ class Account(BaseModel):
         if acc.lock_times > 0:
             acc.lock_time = datetime.utcfromtimestamp(0)
             acc.lock_times = 0
-            acc.lock_reason = null
+            acc.lock_reason = None
             acc.save()
 
 class DbLock(BaseModel):
