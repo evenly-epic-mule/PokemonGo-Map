@@ -10,6 +10,7 @@ import gc
 import time
 import geopy
 import math
+import os
 from peewee import SqliteDatabase, InsertQuery, Check, CompositeKey, \
     IntegerField, CharField, DoubleField, BooleanField, \
     DateTimeField, fn, DeleteQuery, FloatField, SQL, TextField, JOIN
@@ -45,8 +46,8 @@ def init_database(app):
     if args.db_type == 'mysql':
         log.info('Connecting to MySQL database on %s:%i', args.db_host, args.db_port)
         connections = args.db_max_connections
-        if hasattr(args, 'accounts'):
-            connections *= len(args.accounts)
+        if hasattr(args, 'worker'):
+            connections *= args.worker
         db = MyRetryDB(
             args.db_name,
             user=args.db_user,
@@ -1417,6 +1418,101 @@ class GymDetails(BaseModel):
     url = CharField()
     last_scanned = DateTimeField(default=datetime.utcnow)
 
+class Account(BaseModel):
+    name = CharField(primary_key=True, max_length=16)
+    password = CharField(max_length=20)
+    auth_service = CharField(max_length=10, default="ptc")
+    last_used = DateTimeField(default=datetime.utcfromtimestamp(0))
+    uses = IntegerField(default=0)
+    uses_total = IntegerField(default=0)
+    latitude = DoubleField()
+    longitude = DoubleField()
+    lock_time = DateTimeField(default=datetime.utcfromtimestamp(0))
+    lock_times = IntegerField(default=0)
+    lock_reason = CharField(null=True, max_length=50)
+    captcha = IntegerField(default=0)
+
+    class Meta:
+        indexes = ((('latitude', 'longitude'), False),)
+
+    @staticmethod
+    def get_next(thread_id):
+        # init dblock if not exists
+        dblock, created = DbLock.get_or_create(name="account")
+        # clear any hanging locks
+        if dblock.time < datetime.utcfromtimestamp(time.time()-30):
+            dblock.pid = 0
+            dblock.thread = 0
+
+        while True:
+            log.debug("getting lock for accounts table")
+            while dblock.pid != 0 and dblock.thread != 0: # try to acquire lock over db
+                dblock = DbLock.get(name="account")
+                time.sleep(1)
+            dblock.pid = os.getpid() # write own pid
+            dblock.thread = thread_id
+            dblock.time = datetime.utcnow()
+            dblock.save()
+            check = DbLock.get(name="account")
+            if dblock.pid == check.pid and dblock.thread == check.thread: # check if lock could be acquired
+                break
+            time.sleep(1)
+        try:
+            log.debug("got lock for accounts table")
+
+            query = (Account.select()
+                    .where(Account.last_used < datetime.utcfromtimestamp(time.time() - (4 * 60 * 60)),
+                        Account.lock_time < datetime.utcnow())
+                    .order_by(Account.captcha, Account.captcha/(Account.uses_total+1), Account.uses_total)
+                    .limit(1))
+            acc = query.first()
+
+            if acc is not None:
+                acc.last_used = datetime.utcnow()
+                if acc.lock_time is None:
+                    acc.lock_time = datetime.utcfromtimestamp(0)
+                acc.save()
+
+        # release dblock
+        finally:
+            dblock.pid = 0
+            dblock.thread = 0
+            dblock.save()
+        return acc
+
+    def use(self, Lat, Lng):
+        self.last_used = datetime.utcnow()
+        self.latitude = Lat
+        self.longitude = Lng
+        self.uses += 1
+        self.uses_total += 1
+        self.save()
+
+    def count_captcha(self):
+        self.captcha += 1
+        self.save()
+
+    def lock(self, lock_time, reason):
+        self.lock_time = datetime.utcfromtimestamp(time.time() + (lock_time * (2 ** self.lock_times)))
+        self.lock_times += 1
+        self.lock_reason = reason
+        self.save()
+
+    def reset_lock(self):
+        if self.lock_times > 0:
+            if self.lock_reason == "captcha":
+                self.uses = 0
+            self.lock_time = datetime.utcfromtimestamp(0)
+            self.lock_times = 0
+            self.lock_reason = None
+            self.save()
+
+class DbLock(BaseModel):
+    name = CharField(max_length=10, primary_key=True)
+    pid = IntegerField(default=0)
+    thread = IntegerField(default=0)
+    time = DateTimeField(default=datetime.utcfromtimestamp(0))
+
 
 def hex_bounds(center, steps=None, radius=None):
     # Make a box that is (70m * step_limit * 2) + 70m away from the center point
@@ -1960,14 +2056,14 @@ def bulk_upsert(cls, data):
 def create_tables(db):
     db.connect()
     verify_database_schema(db)
-    db.create_tables([Pokemon, Pokestop, Gym, ScannedLocation, GymDetails, GymMember, GymPokemon,
+    db.create_tables([Account, DbLock, Pokemon, Pokestop, Gym, ScannedLocation, GymDetails, GymMember, GymPokemon,
                       Trainer, MainWorker, WorkerStatus, SpawnPoint, ScanSpawnPoint, SpawnpointDetectionData], safe=True)
     db.close()
 
 
 def drop_tables(db):
     db.connect()
-    db.drop_tables([Pokemon, Pokestop, Gym, ScannedLocation, Versions, GymDetails, GymMember, GymPokemon,
+    db.drop_tables([Account, DbLock, Pokemon, Pokestop, Gym, ScannedLocation, Versions, GymDetails, GymMember, GymPokemon,
                     Trainer, MainWorker, WorkerStatus, SpawnPoint, ScanSpawnPoint, SpawnpointDetectionData, Versions], safe=True)
     db.close()
 

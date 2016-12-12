@@ -37,7 +37,7 @@ from pgoapi.utilities import f2i
 from pgoapi import utilities as util
 from pgoapi.exceptions import AuthException
 
-from .models import parse_map, GymDetails, parse_gyms, MainWorker, WorkerStatus
+from .models import parse_map, GymDetails, parse_gyms, MainWorker, WorkerStatus, Account
 from .fakePogoApi import FakePogoApi
 from .utils import now
 from .transform import get_new_coords
@@ -88,13 +88,10 @@ def switch_status_printer(display_type, current_page):
                 current_page[0] = int(command)
                 mainlog.handlers[0].setLevel(logging.CRITICAL)
                 display_type[0] = 'workers'
-        elif command.lower() == 'f':
-                mainlog.handlers[0].setLevel(logging.CRITICAL)
-                display_type[0] = 'failedaccounts'
 
 
 # Thread to print out the status of each worker.
-def status_printer(threadStatus, search_items_queue_array, db_updates_queue, wh_queue, account_queue, account_failures):
+def status_printer(threadStatus, search_items_queue_array, db_updates_queue, wh_queue):
     display_type = ["workers"]
     current_page = [1]
 
@@ -136,8 +133,8 @@ def status_printer(threadStatus, search_items_queue_array, db_updates_queue, wh_
             for i in range(0, len(search_items_queue_array)):
                 search_items_queue_size += search_items_queue_array[i].qsize()
 
-            status_text.append('Queues: {} search items, {} db updates, {} webhook.  Total skipped items: {}. Spare accounts available: {}. Accounts on hold: {}'
-                               .format(search_items_queue_size, db_updates_queue.qsize(), wh_queue.qsize(), skip_total, account_queue.qsize(), len(account_failures)))
+            status_text.append('Queues: {} search items, {} db updates, {} webhook.  Total skipped items: {}'
+                               .format(search_items_queue_size, db_updates_queue.qsize(), wh_queue.qsize(), skip_total))
 
             # Print status of overseer.
             status_text.append('{} Overseer: {}'.format(threadStatus['Overseer']['scheduler'], threadStatus['Overseer']['message']))
@@ -183,53 +180,12 @@ def status_printer(threadStatus, search_items_queue_array, db_updates_queue, wh_
 
                     status_text.append(status.format(item, time.strftime('%H:%M', time.localtime(threadStatus[item]['starttime'])), threadStatus[item]['username'], threadStatus[item]['proxy_display'], threadStatus[item]['success'], threadStatus[item]['fail'], threadStatus[item]['noitems'], threadStatus[item]['skip'], threadStatus[item]['message']))
 
-        elif display_type[0] == 'failedaccounts':
-            status_text.append('-----------------------------------------')
-            status_text.append('Accounts on hold:')
-            status_text.append('-----------------------------------------')
-
-            # Find the longest account name.
-            userlen = 4
-            for account in account_failures:
-                userlen = max(userlen, len(account['account']['username']))
-
-            status = '{:' + str(userlen) + '} | {:10} | {:20}'
-            status_text.append(status.format('User', 'Hold Time', 'Reason'))
-
-            for account in account_failures:
-                status_text.append(status.format(account['account']['username'], time.strftime('%H:%M:%S', time.localtime(account['last_fail_time'])), account['reason']))
-
         # Print the status_text for the current screen.
         status_text.append('Page {}/{}. Page number to switch pages. F to show on hold accounts. <ENTER> alone to switch between status and log view'.format(current_page[0], total_pages))
         # Clear the screen.
         os.system('cls' if os.name == 'nt' else 'clear')
         # Print status.
         print "\n".join(status_text)
-
-
-# The account recycler monitors failed accounts and places them back in the account queue 2 hours after they failed.
-# This allows accounts that were soft banned to be retried after giving them a chance to cool down.
-def account_recycler(accounts_queue, account_failures, args):
-    while True:
-        # Run once a minute.
-        time.sleep(60)
-        log.info('Account recycler running. Checking status of {} accounts'.format(len(account_failures)))
-
-        # Create a new copy of the failure list to search through, so we can iterate through it without it changing.
-        failed_temp = list(account_failures)
-
-        # Search through the list for any item that last failed before -ari/--account-rest-interval seconds
-        ok_time = now() - args.account_rest_interval
-        for a in failed_temp:
-            if a['last_fail_time'] <= ok_time:
-                # Remove the account from the real list, and add to the account queue.
-                log.info('Account {} returning to active duty.'.format(a['account']['username']))
-                account_failures.remove(a)
-                accounts_queue.put(a['account'])
-            else:
-                if 'notified' not in a:
-                    log.info('Account {} needs to cool off for {} minutes due to {}'.format(a['account']['username'], round((a['last_fail_time'] - ok_time) / 60, 0), a['reason']))
-                    a['notified'] = True
 
 
 def worker_status_db_thread(threads_status, name, db_updates_queue):
@@ -260,20 +216,7 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb, db_updat
 
     search_items_queue_array = []
     scheduler_array = []
-    account_queue = Queue()
     threadStatus = {}
-
-    '''
-    Create a queue of accounts for workers to pull from. When a worker has failed too many times,
-    it can get a new account from the queue and reinitialize the API. Workers should return accounts
-    to the queue so they can be tried again later, but must wait a bit before doing do so to
-    prevent accounts from being cycled through too quickly.
-    '''
-    for i, account in enumerate(args.accounts):
-        account_queue.put(account)
-
-    # Create a list for failed accounts.
-    account_failures = []
 
     threadStatus['Overseer'] = {
         'message': 'Initializing',
@@ -285,15 +228,9 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb, db_updat
         log.info('Starting status printer thread')
         t = Thread(target=status_printer,
                    name='status_printer',
-                   args=(threadStatus, search_items_queue_array, db_updates_queue, wh_queue, account_queue, account_failures))
+                   args=(threadStatus, search_items_queue_array, db_updates_queue, wh_queue))
         t.daemon = True
         t.start()
-
-    # Create account recycler thread.
-    log.info('Starting account recycler thread')
-    t = Thread(target=account_recycler, name='account-recycler', args=(account_queue, account_failures, args))
-    t.daemon = True
-    t.start()
 
     if args.status_name is not None:
         log.info('Starting status database thread')
@@ -335,7 +272,7 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb, db_updat
 
         t = Thread(target=search_worker_thread,
                    name='search-worker-{}'.format(i),
-                   args=(args, account_queue, account_failures, search_items_queue, pause_bit,
+                   args=(i, args, search_items_queue, pause_bit,
                          threadStatus[workerId],
                          db_updates_queue, wh_queue, scheduler))
         t.daemon = True
@@ -454,9 +391,10 @@ def generate_hive_locations(current_location, step_distance, step_limit, worker_
     return results
 
 
-def search_worker_thread(args, account_queue, account_failures, search_items_queue, pause_bit, status, dbq, whq, scheduler):
+def search_worker_thread(thread_num, args, search_items_queue, pause_bit, status, dbq, whq, scheduler):
 
     log.debug('Search worker thread starting')
+    stagger_thread(args, thread_num)
 
     # The outer forever loop restarts only when the inner one is intentionally exited - which should only be done when the worker is failing too often, and probably banned.
     # This reinitializes the API and grabs a new account from the queue.
@@ -471,12 +409,15 @@ def search_worker_thread(args, account_queue, account_failures, search_items_que
             while not scheduler.ready:
                 time.sleep(1)
 
-            account = account_queue.get()
-            status.update(WorkerStatus.get_worker(account['username'], scheduler.scan_location))
-            status['message'] = 'Switching to account {}'.format(account['username'])
-            log.info(status['message'])
+            account = Account.get_next(thread_num)
+            if account is None:
+                log.error("there are no more free accounts available, sleeping 60s")
+                time.sleep(60)
+                continue
 
-            stagger_thread(args, account)
+            status.update(WorkerStatus.get_worker(account.name, scheduler.scan_location))
+            status['message'] = 'Switching to account {}'.format(account.name)
+            log.info(status['message'])
 
             # New lease of life right here.
             status['fail'] = 0
@@ -521,31 +462,23 @@ def search_worker_thread(args, account_queue, account_failures, search_items_que
 
                 # If this account has been messing up too hard, let it rest
                 if (args.max_failures > 0) and (consecutive_fails >= args.max_failures):
-                    status['message'] = 'Account {} failed more than {} scans; possibly bad account. Switching accounts...'.format(account['username'], args.max_failures)
+                    status['message'] = 'Account {} failed more than {} scans; possibly bad account. Switching accounts...'.format(account.name, args.max_failures)
                     log.warning(status['message'])
-                    account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'failures'})
+                    account.lock(args.account_rest_interval, 'failures')
                     break  # exit this loop to get a new account and have the API recreated
 
                 # If this account had not find anything for too long, let it rest
                 if (args.max_empty > 0) and (consecutive_noitems >= args.max_empty):
-                    status['message'] = 'Account {} returned empty scan for more than {} scans; possibly ip is banned. Switching accounts...'.format(account['username'], args.max_empty)
+                    status['message'] = 'Account {} returned empty scan for more than {} scans; possibly ip is banned. Switching accounts...'.format(account.name, args.max_empty)
                     log.warning(status['message'])
-                    account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'empty scans'})
-                    break  # exit this loop to get a new account and have the API recreated
-
-                # If used proxy disappears from "live list" after background checking - switch account but DO not freeze it (it's not an account failure)
-                if (args.proxy) and (not status['proxy_url'] in args.proxy):
-                    status['message'] = 'Account {} proxy {} is not in a live list any more. Switching accounts...'.format(account['username'], status['proxy_url'])
-                    log.warning(status['message'])
-                    account_queue.put(account)  # experimantal, nobody did this before :)
+                    account.lock(args.account_rest_interval, 'empty scans')
                     break  # exit this loop to get a new account and have the API recreated
 
                 # If this account has been running too long, let it rest
                 if (args.account_search_interval is not None):
                     if (status['starttime'] <= (now() - args.account_search_interval)):
-                        status['message'] = 'Account {} is being rotated out to rest.'.format(account['username'])
+                        status['message'] = 'Account {} is being rotated out to rest.'.format(account.name)
                         log.info(status['message'])
-                        account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'rest interval'})
                         break
 
                 # Grab the next thing to search (when available)
@@ -591,10 +524,15 @@ def search_worker_thread(args, account_queue, account_failures, search_items_que
                 # doing this before check_login so it does not also have to be done there
                 # when the auth token is refreshed
                 api.set_position(*step_location)
+                account.use(step_location[0], step_location[1])
 
                 # Ok, let's get started -- check our login status
                 status['message'] = 'Logging in...'
-                check_login(args, account, api, step_location, status['proxy_url'])
+                try:
+                    check_login(args, account, api, step_location, status['proxy_url'])
+                except TooManyLoginAttempts:
+                    account.lock(args.account_rest_interval, 'Exceeded login attempts')
+                    break
 
                 # putting this message after the check_login so the messages aren't out of order
                 status['message'] = messages['search']
@@ -624,27 +562,29 @@ def search_worker_thread(args, account_queue, account_failures, search_items_que
                     if args.captcha_solving:
                         captcha_url = response_dict['responses']['CHECK_CHALLENGE']['challenge_url']
                         if len(captcha_url) > 1:
-                            status['message'] = 'Account {} is encountering a captcha, starting 2captcha sequence'.format(account['username'])
+                            status['message'] = 'Account {} is encountering a captcha, starting 2captcha sequence'.format(account.name)
                             log.warning(status['message'])
+                            account.count_captcha()
                             captcha_token = token_request(args, status, captcha_url)
                             if 'ERROR' in captcha_token:
                                 log.warning("Unable to resolve captcha, please check your 2captcha API key and/or wallet balance")
-                                account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'catpcha failed to verify'})
+                                account.lock(args.account_rest_interval, 'captcha')
+                                time.sleep(5)
                                 break
                             else:
-                                status['message'] = 'Retrieved captcha token, attempting to verify challenge for {}'.format(account['username'])
+                                status['message'] = 'Retrieved captcha token, attempting to verify challenge for {}'.format(account.name)
                                 log.info(status['message'])
                                 response = api.verify_challenge(token=captcha_token)
                                 if 'success' in response['responses']['VERIFY_CHALLENGE']:
-                                    status['message'] = "Account {} successfully uncaptcha'd".format(account['username'])
+                                    status['message'] = "Account {} successfully uncaptcha'd".format(account.name)
                                     log.info(status['message'])
                                     status['last_scan_date'] = datetime.utcnow()
                                     # Make another request for the same coordinate since the previous one was captcha'd
                                     response_dict = map_request(api, step_location, args.jitter)
                                 else:
-                                    status['message'] = "Account {} failed verifyChallenge, putting away account for now".format(account['username'])
+                                    status['message'] = "Account {} failed verifyChallenge, putting away account for now".format(account.name)
                                     log.info(status['message'])
-                                    account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'catpcha failed to verify'})
+                                    account.lock(args.account_rest_interval/4, 'captcha')
                                     break
 
                     parsed = parse_map(args, response_dict, step_location, dbq, whq, api, status['last_scan_date'])
@@ -652,6 +592,7 @@ def search_worker_thread(args, account_queue, account_failures, search_items_que
                     if parsed['count'] > 0:
                         status['success'] += 1
                         consecutive_noitems = 0
+                        account.reset_lock()
                     else:
                         status['noitems'] += 1
                         consecutive_noitems += 1
@@ -664,7 +605,7 @@ def search_worker_thread(args, account_queue, account_failures, search_items_que
                     status['fail'] += 1
                     consecutive_fails += 1
                     # consecutive_noitems = 0 - I propose to leave noitems counter in case of error
-                    status['message'] = 'Map parse failed at {:6f},{:6f}, abandoning location. {} may be banned.'.format(step_location[0], step_location[1], account['username'])
+                    status['message'] = 'Map parse failed at {:6f},{:6f}, abandoning location. {} may be banned.'.format(step_location[0], step_location[1], account.name)
                     log.exception('{}. Exception message: {}'.format(status['message'], e))
 
                 # Get detailed information about gyms.
@@ -726,11 +667,14 @@ def search_worker_thread(args, account_queue, account_failures, search_items_que
 
         # Catch any process exceptions, log them, and continue the thread.
         except Exception as e:
-            log.error('Exception in search_worker under account {} Exception message: {}'.format(account['username'], e))
-            status['message'] = 'Exception in search_worker using account {}. Restarting with fresh account. See logs for details.'.format(account['username'])
-            traceback.print_exc(file=sys.stdout)
-            account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'exception'})
-            time.sleep(args.scan_delay)
+            try:
+                log.error('Exception in search_worker under account {} Exception message: {}'.format(account.name, e))
+                traceback.print_exc(file=sys.stdout)
+                account.lock(args.account_rest_interval, e)
+                time.sleep(args.scan_delay)
+            except NameError:
+                log.error('Exception in search_worker Exception message: {}'.format(e))
+                time.sleep(args.scan_delay)
 
 
 def check_login(args, account, api, position, proxy_url):
@@ -747,19 +691,19 @@ def check_login(args, account, api, position, proxy_url):
     while i < args.login_retries:
         try:
             if proxy_url:
-                api.set_authentication(provider=account['auth_service'], username=account['username'], password=account['password'], proxy_config={'http': proxy_url, 'https': proxy_url})
+                api.set_authentication(provider=account.auth_service, username=account.name, password=account.password, proxy_config={'http': proxy_url, 'https': proxy_url})
             else:
-                api.set_authentication(provider=account['auth_service'], username=account['username'], password=account['password'])
+                api.set_authentication(provider=account.auth_service, username=account.name, password=account.password)
             break
         except AuthException:
             if i >= args.login_retries:
                 raise TooManyLoginAttempts('Exceeded login attempts')
             else:
                 i += 1
-                log.error('Failed to login to Pokemon Go with account %s. Trying again in %g seconds', account['username'], args.login_delay)
+                log.error('Failed to login to Pokemon Go with account %s. Trying again in %g seconds', account.name, args.login_delay)
                 time.sleep(args.login_delay)
 
-    log.debug('Login for account %s successful', account['username'])
+    log.debug('Login for account %s successful', account.name)
     time.sleep(20)
 
 
@@ -857,10 +801,10 @@ def calc_distance(pos1, pos2):
 
 
 # Delay each thread start time so that logins occur after delay.
-def stagger_thread(args, account):
-    if args.accounts.index(account) == 0:
+def stagger_thread(args, num):
+    if num == 0:
         return  # No need to delay the first one.
-    delay = args.accounts.index(account) * args.login_delay + ((random.random() - .5) / 2)
+    delay = num * args.login_delay + ((random.random() - .5) / 2)
     log.debug('Delaying thread startup for %.2f seconds', delay)
     time.sleep(delay)
 
