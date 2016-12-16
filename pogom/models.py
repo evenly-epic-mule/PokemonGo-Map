@@ -11,7 +11,8 @@ import time
 import geopy
 import math
 import os
-from peewee import SqliteDatabase, InsertQuery, Check, CompositeKey, \
+from peewee import SqliteDatabase, InsertQuery, \
+    Check, CompositeKey, \
     IntegerField, CharField, DoubleField, BooleanField, \
     DateTimeField, fn, DeleteQuery, FloatField, SQL, TextField, JOIN
 from playhouse.flask_utils import FlaskDB
@@ -1078,6 +1079,9 @@ class SpawnPoint(BaseModel):
     def start_end(cls, sp, spawn_delay=0, links=False):
         links_arg = links
         links = links if links else str(sp['links'])
+
+        if links == '????':  # clean up for old data
+            links = str(sp['kind'].replace('s', '?'))
 
         # make some assumptions if link not fully identified
         if links.count('-') == 0:
